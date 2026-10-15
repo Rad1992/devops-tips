@@ -1,4 +1,3 @@
-#!/usr/bin/env groovy
 /*
  * =====================================================================================
  *  PIPELINE CI/CD DÉCLARATIF : GitLab CE -> Jenkins -> SonarQube CE / Xray (Frogbot) -> Artifactory
@@ -25,20 +24,14 @@
  *                gitlab-webhook-token (Secret text) | artifactory-deployer (User/Password) | jfrog-access-token (Secret text)
  *  GITLAB  : activer "Pipelines must succeed" (Settings > Merge requests) sur les projets pour bloquer les MR.
  *  1er lancement manuel obligatoire pour enregistrer trigger + paramètres (le build sera NOT_BUILT).
- *
- *  TEST SUR UN SEUL PROJET (paramètre GITLAB_PROJECT, ex: team/mon-app) :
- *   - Restreindre le webhook : lancer "Build with Parameters" avec GITLAB_PROJECT renseigné (MR_IID vide).
- *     La valeur est mémorisée : seuls les événements de ce projet déclenchent ensuite la CI/CD.
- *     Vider GITLAB_PROJECT (et relancer) pour revenir à tous les projets.
- *   - Tester sans webhook : GITLAB_PROJECT + MR_IID (+ SIMULATE_EVENT) -> la MR est lue via l'API GitLab
- *     et le pipeline s'exécute comme si GitLab avait envoyé l'événement. DRY_RUN=true pour ne rien livrer.
  * =====================================================================================
  */
 
 import groovy.transform.Field
 import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
 
-// Configuration structurée (les valeurs simples sont dans le bloc environment)
+// Configuration (surchargeable depuis le Jenkinsfile : genericCiCdWithFilters(CLE: valeur, ...))
+// Les valeurs simples sont exposées comme variables d'environnement (bloc environment).
 @Field Map CFG = [
     // {group} = groupe GitLab du projet (minuscules)
     REPOSITORIES   : [
@@ -54,280 +47,306 @@ import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
     ],
     NPM_DIST_TAGS  : [SNAPSHOT: 'snapshot', RELEASE: 'release', PROD: 'latest'],
     STEPS          : ['Build & Tests', 'SonarQube', 'Xray (Frogbot)', 'Livraison Artifactory'],
+
+    // --- Agent / webhook / credentials (hors bloc environment) ---
+    AGENT_LABEL            : 'maven',
+    WEBHOOK_TOKEN_CRED     : 'gitlab-webhook-token',
+    JFROG_TOKEN_CRED       : 'jfrog-access-token',
+    // --- GitLab ---
+    GITLAB_URL             : 'https://gitlab.example.com',
+    GITLAB_API_CRED_ID     : 'gitlab-api-token',
+    GITLAB_GIT_CRED_ID     : 'gitlab-git-creds',
+    COMMIT_STATUS_NAME     : 'jenkins/ci-cd',
+    // --- Branches ---
+    DEVELOP_BRANCH         : 'develop',
+    RELEASE_BRANCH_REGEX   : '^release.*',
+    PROD_BRANCH            : 'master',
+    VALIDATE_MR_TO_DEVELOP : 'true',      // CI + blocage sur les MR ouvertes vers develop
+    REPO_GROUP_MODE        : 'top',       // 'top' = groupe racine, 'parent' = groupe parent direct
+    // --- JFrog ---
+    JFROG_URL              : 'https://mycompany.jfrog.io',   // sans /artifactory ni / final
+    ARTIFACTORY_CRED_ID    : 'artifactory-deployer',
+    MAVEN_RESOLVE_REPO     : '',          // ex: libs-virtual (mirror Maven), vide = Maven Central
+    NPM_RESOLVE_REPO       : '',          // ex: npm-virtual, vide = registry par défaut
+    FROGBOT_DOWNLOAD_URL   : 'https://releases.jfrog.io/artifactory/frogbot/v2/[RELEASE]/getFrogbot.sh',
+    FROGBOT_MIN_SEVERITY   : 'High',
+    FROGBOT_CMD_ON_MERGE   : 'scan-repository',   // après merge sur develop ('' = pas de scan)
+    XRAY_WATCHES           : '',
+    JFROG_PROJECT          : '',
+    FROGBOT_DEPS_REPO      : '',
+    // --- SonarQube Community Edition ---
+    SONAR_SERVER           : 'SonarQube',
+    SONAR_SCANNER_TOOL     : 'sonar-scanner',
+    SONAR_KEY_PER_FLOW     : 'true',      // clé <groupe>:<projet>:develop|release|master (pas de branches en CE)
+    QUALITY_GATE_TIMEOUT   : '15',
+    // --- Plugins Maven ---
+    VERSIONS_PLUGIN        : 'org.codehaus.mojo:versions-maven-plugin:2.16.2',
+    HELP_PLUGIN            : 'org.apache.maven.plugins:maven-help-plugin:3.4.0',
+    SONAR_MAVEN_PLUGIN     : 'org.sonarsource.scanner.maven:sonar-maven-plugin',
+    // --- Mail ---
+    MAIL_FROM              : 'jenkins@example.com',
+    MAIL_FALLBACK_TO       : 'devops@example.com',
+    MAIL_CC                : '',
+    // --- Dossiers de travail (dans le workspace) ---
+    REPORT_DIR             : '.ci/report',
+    TMP_DIR                : '.ci/tmp',
 ]
 
 // Contexte d'exécution partagé entre les stages
 @Field Map ctx = [failures: [], results: [:]]
 
-pipeline {
-    agent { label 'maven' }
+// Point d'entrée de la shared library :
+//     @Library('new-generic-cicd') _
+//     genericCiCdWithFilters()                                            // configuration par défaut (CFG)
+//     genericCiCdWithFilters(GITLAB_URL: 'https://gitlab.acme.io', AGENT_LABEL: 'docker')
+def call(Map config = [:]) {
+    CFG.putAll(config)
 
-    tools {
-        maven  'maven-3.9'
-        jdk    'jdk-21'
-        nodejs 'nodejs-20'
-    }
+    pipeline {
+        agent { label "${CFG.AGENT_LABEL}" }
 
-    options {
-        buildDiscarder(logRotator(numToKeepStr: '100', artifactNumToKeepStr: '30'))
-        timestamps()
-        timeout(time: 60, unit: 'MINUTES')
-        skipDefaultCheckout()
-    }
-
-    parameters {
-        // Valeur "collante" : la dernière valeur saisie devient la valeur par défaut des builds suivants,
-        // y compris ceux lancés par le webhook -> le filtre projet reste actif jusqu'à ce qu'on le vide.
-        string(name: 'GITLAB_PROJECT', defaultValue: (params.GITLAB_PROJECT ?: ''), trim: true,
-               description: 'Projet GitLab de test (chemin complet, ex: team/mon-app). Seuls ses événements déclenchent la CI/CD. Vide = tous les projets.')
-        string(name: 'MR_IID', defaultValue: '', trim: true,
-               description: 'Test manuel sans webhook : n° de la MR (ex: 42 pour !42) dans GITLAB_PROJECT. Vide = mode webhook.')
-        choice(name: 'SIMULATE_EVENT', choices: ['auto', 'open', 'merge'],
-               description: "Test manuel : événement simulé. auto = 'merge' si la MR est fusionnée, sinon 'open'.")
-        text(name: 'GL_PAYLOAD', defaultValue: '',
-             description: 'Payload JSON du System Hook GitLab (rempli automatiquement ; collez-en un pour rejouer un événement)')
-        booleanParam(name: 'DRY_RUN', defaultValue: false, description: 'Exécuter la CI sans livrer dans Artifactory')
-        booleanParam(name: 'SEND_EMAIL', defaultValue: true, description: 'Envoyer le résultat par e-mail au committer')
-    }
-
-    triggers {
-        GenericTrigger(
-            genericVariables: [
-                [key: 'GL_PAYLOAD',       value: '$'],
-                [key: 'GL_OBJECT_KIND',   value: '$.object_kind'],
-                [key: 'GL_ACTION',        value: '$.object_attributes.action'],
-                [key: 'GL_SOURCE_BRANCH', value: '$.object_attributes.source_branch'],
-                [key: 'GL_TARGET_BRANCH', value: '$.object_attributes.target_branch'],
-                [key: 'GL_PROJECT',       value: '$.project.path_with_namespace'],
-                [key: 'GL_MR_IID',        value: '$.object_attributes.iid'],
-            ],
-            tokenCredentialId        : 'gitlab-webhook-token',
-            causeString              : 'GitLab MR !$GL_MR_IID ($GL_ACTION) $GL_SOURCE_BRANCH -> $GL_TARGET_BRANCH [$GL_PROJECT]',
-            printContributedVariables: false,
-            printPostContent         : false,
-            // Filtre appliqué AVANT de créer un build : texte "type#action#source#cible#projet"
-            //   ex. "merge_request#open#develop#release/1.3#team/mon-app"
-            // Seuls les flux gérés déclenchent un build :
-            //   * -> develop          : open | reopen | update | merge   (VALIDATE / SNAPSHOT)
-            //   develop -> release*   : open | reopen | update           (RELEASE)
-            //   release* -> master    : open | reopen | update           (PROD)
-            // + uniquement le projet GITLAB_PROJECT s'il est renseigné (sinon tous les projets).
-            // /!\ Le bloc triggers ne peut pas lire "environment" : garder ces noms de branches
-            //     cohérents avec DEVELOP_BRANCH, RELEASE_BRANCH_REGEX et PROD_BRANCH.
-            // NB : le filtre est ré-enregistré à chaque build -> il prend effet APRÈS le build
-            //      où GITLAB_PROJECT a été modifié.
-            regexpFilterText         : '$GL_OBJECT_KIND#$GL_ACTION#$GL_SOURCE_BRANCH#$GL_TARGET_BRANCH#$GL_PROJECT',
-            regexpFilterExpression   : '^merge_request#(' +
-                                       '(open|reopen|update|merge)#[^#]+#develop' +
-                                       '|(open|reopen|update)#develop#release[^#]*' +
-                                       '|(open|reopen|update)#release[^#]*#master' +
-                                       ')#' +
-                                       (params.GITLAB_PROJECT?.trim() ? params.GITLAB_PROJECT.trim().replace('.', '\\.') : '[^#]+') +
-                                       '$'
-        )
-    }
-
-    environment {
-        // --- GitLab ---
-        GITLAB_URL             = 'https://gitlab.example.com'
-        GITLAB_API_CRED_ID     = 'gitlab-api-token'
-        GITLAB_GIT_CRED_ID     = 'gitlab-git-creds'
-        COMMIT_STATUS_NAME     = 'jenkins/ci-cd'
-        // --- Branches ---
-        DEVELOP_BRANCH         = 'develop'
-        RELEASE_BRANCH_REGEX   = '^release.*'
-        PROD_BRANCH            = 'master'
-        VALIDATE_MR_TO_DEVELOP = 'true'      // CI + blocage sur les MR ouvertes vers develop
-        REPO_GROUP_MODE        = 'top'       // 'top' = groupe racine, 'parent' = groupe parent direct
-        // --- JFrog ---
-        JFROG_URL              = 'https://mycompany.jfrog.io'   // sans /artifactory ni / final
-        ARTIFACTORY_CRED_ID    = 'artifactory-deployer'
-        MAVEN_RESOLVE_REPO     = ''          // ex: libs-virtual (mirror Maven), vide = Maven Central
-        NPM_RESOLVE_REPO       = ''          // ex: npm-virtual, vide = registry par défaut
-        FROGBOT_DOWNLOAD_URL   = 'https://releases.jfrog.io/artifactory/frogbot/v2/[RELEASE]/getFrogbot.sh'
-        FROGBOT_MIN_SEVERITY   = 'High'
-        FROGBOT_CMD_ON_MERGE   = 'scan-repository'   // après merge sur develop ('' = pas de scan)
-        XRAY_WATCHES           = ''
-        JFROG_PROJECT          = ''
-        FROGBOT_DEPS_REPO      = ''
-        // --- SonarQube Community Edition ---
-        SONAR_SERVER           = 'SonarQube'
-        SONAR_SCANNER_TOOL     = 'sonar-scanner'
-        SONAR_KEY_PER_FLOW     = 'true'      // clé <groupe>:<projet>:develop|release|master (pas de branches en CE)
-        QUALITY_GATE_TIMEOUT   = '15'
-        // --- Plugins Maven ---
-        VERSIONS_PLUGIN        = 'org.codehaus.mojo:versions-maven-plugin:2.16.2'
-        HELP_PLUGIN            = 'org.apache.maven.plugins:maven-help-plugin:3.4.0'
-        SONAR_MAVEN_PLUGIN     = 'org.sonarsource.scanner.maven:sonar-maven-plugin'
-        // --- Mail ---
-        MAIL_FROM              = 'jenkins@example.com'
-        MAIL_FALLBACK_TO       = 'devops@example.com'
-        MAIL_CC                = ''
-        // --- Dossiers de travail (dans le workspace) ---
-        REPORT_DIR             = '.ci/report'
-        TMP_DIR                = '.ci/tmp'
-    }
-
-    stages {
-
-        stage('Prepare') {
-            steps {
-                script {
-                    def evt = loadEvent()
-                    if (evt) parseEvent(evt)
-                    ctx.mode = resolveMode()
-
-                    // Filtre projet (filet de sécurité si le filtre du webhook n'est pas encore à jour)
-                    String onlyProject = params.GITLAB_PROJECT?.trim()
-                    if (ctx.mode && onlyProject && ctx.projectPath?.toLowerCase() != onlyProject.toLowerCase()) {
-                        echo "Projet ${ctx.projectPath} ignoré : seul ${onlyProject} est testé (paramètre GITLAB_PROJECT)."
-                        ctx.mode = null
-                    }
-                    if (!evt && onlyProject) {
-                        echo "Filtre projet enregistré : ${onlyProject}. Les prochains webhooks ne concerneront que ce projet."
-                    }
-
-                    if (!ctx.mode) {
-                        echo 'Événement non concerné par la CI/CD -> rien à faire.'
-                        currentBuild.result = 'NOT_BUILT'
-                        currentBuild.description = "Ignoré : ${ctx.projectPath ?: 'pas de payload'} ${ctx.source ?: ''} -> ${ctx.target ?: ''} (${ctx.action ?: '-'})"
-                    } else {
-                        currentBuild.displayName = "#${env.BUILD_NUMBER} ${ctx.manual ? '[TEST] ' : ''}${ctx.projectName} !${ctx.mrIid} ${ctx.mode}"
-                    }
-                }
-            }
+        tools {
+            maven  'maven-3.9'
+            jdk    'jdk-21'
+            nodejs 'nodejs-20'
         }
 
-        stage('Checkout & Detect') {
-            when { expression { return ctx.mode != null } }
-            steps {
-                script {
-                    checkoutSources()
-                    sh 'rm -rf "$REPORT_DIR" "$TMP_DIR" && mkdir -p "$REPORT_DIR" "$TMP_DIR"'
-
-                    ctx.type = fileExists('pom.xml') ? 'maven' : (fileExists('package.json') ? 'npm' : null)
-                    if (!ctx.type) {
-                        echo 'Ni pom.xml ni package.json -> rien à faire.'
-                        currentBuild.result = 'NOT_BUILT'
-                        currentBuild.description = "Ignoré : ${ctx.projectPath} n'est ni Maven ni npm"
-                        return
-                    }
-                    echo "Type de projet : ${ctx.type}"
-                    currentBuild.description = "${ctx.projectPath} | ${ctx.source} -> ${ctx.target} | ${ctx.mode} | ${ctx.type}"
-                    prepareToolConfig()
-
-                    // statut "running" : la MR reste bloquée pendant l'exécution
-                    ctx.statusSha = (ctx.mode == 'SNAPSHOT') ? ctx.buildSha : ctx.headSha
-                    setCommitStatus('running', "CI/CD ${ctx.mode} en cours")
-                    resolveCommitter()
-                }
-            }
+        options {
+            buildDiscarder(logRotator(numToKeepStr: '100', artifactNumToKeepStr: '30'))
+            timestamps()
+            timeout(time: 60, unit: 'MINUTES')
+            skipDefaultCheckout()
         }
 
-        stage('Build & Tests') {
-            when { expression { return ctx.type != null } }
-            steps {
-                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
+        parameters {
+            text(name: 'GL_PAYLOAD', defaultValue: '',
+                 description: 'Payload JSON du System Hook GitLab (rempli automatiquement ; collez-en un pour rejouer un événement)')
+            booleanParam(name: 'DRY_RUN', defaultValue: false, description: 'Exécuter la CI sans livrer dans Artifactory')
+            booleanParam(name: 'SEND_EMAIL', defaultValue: true, description: 'Envoyer le résultat par e-mail au committer')
+        }
+
+        triggers {
+            GenericTrigger(
+                genericVariables: [
+                    [key: 'GL_PAYLOAD',       value: '$'],
+                    [key: 'GL_OBJECT_KIND',   value: '$.object_kind'],
+                    [key: 'GL_ACTION',        value: '$.object_attributes.action'],
+                    [key: 'GL_SOURCE_BRANCH', value: '$.object_attributes.source_branch'],
+                    [key: 'GL_TARGET_BRANCH', value: '$.object_attributes.target_branch'],
+                    [key: 'GL_PROJECT',       value: '$.project.path_with_namespace'],
+                    [key: 'GL_MR_IID',        value: '$.object_attributes.iid'],
+                ],
+                tokenCredentialId        : CFG.WEBHOOK_TOKEN_CRED,
+                causeString              : 'GitLab MR !$GL_MR_IID ($GL_ACTION) $GL_SOURCE_BRANCH -> $GL_TARGET_BRANCH [$GL_PROJECT]',
+                printContributedVariables: false,
+                printPostContent         : false,
+                // Filtre appliqué AVANT de créer un build : texte "type#action#source#cible"
+                //   ex. "merge_request#open#develop#release/1.3"
+                // Seuls les flux gérés déclenchent un build :
+                //   * -> develop          : open | reopen | update | merge   (VALIDATE / SNAPSHOT)
+                //   develop -> release*   : open | reopen | update           (RELEASE)
+                //   release* -> master    : open | reopen | update           (PROD)
+                // /!\ Le bloc triggers ne lit pas "environment" : garder ces noms de branches
+                //     cohérents avec DEVELOP_BRANCH, RELEASE_BRANCH_REGEX et PROD_BRANCH.
+                regexpFilterText         : '$GL_OBJECT_KIND#$GL_ACTION#$GL_SOURCE_BRANCH#$GL_TARGET_BRANCH',
+                regexpFilterExpression   : '^merge_request#(' +
+                                           '(open|reopen|update|merge)#[^#]+#develop' +
+                                           '|(open|reopen|update)#develop#release[^#]*' +
+                                           '|(open|reopen|update)#release[^#]*#master' +
+                                           ')$'
+            )
+        }
+
+        environment {
+            // --- GitLab ---
+            GITLAB_URL             = "${CFG.GITLAB_URL}"
+            GITLAB_API_CRED_ID     = "${CFG.GITLAB_API_CRED_ID}"
+            GITLAB_GIT_CRED_ID     = "${CFG.GITLAB_GIT_CRED_ID}"
+            COMMIT_STATUS_NAME     = "${CFG.COMMIT_STATUS_NAME}"
+            // --- Branches ---
+            DEVELOP_BRANCH         = "${CFG.DEVELOP_BRANCH}"
+            RELEASE_BRANCH_REGEX   = "${CFG.RELEASE_BRANCH_REGEX}"
+            PROD_BRANCH            = "${CFG.PROD_BRANCH}"
+            VALIDATE_MR_TO_DEVELOP = "${CFG.VALIDATE_MR_TO_DEVELOP}"
+            REPO_GROUP_MODE        = "${CFG.REPO_GROUP_MODE}"
+            // --- JFrog ---
+            JFROG_URL              = "${CFG.JFROG_URL}"
+            ARTIFACTORY_CRED_ID    = "${CFG.ARTIFACTORY_CRED_ID}"
+            MAVEN_RESOLVE_REPO     = "${CFG.MAVEN_RESOLVE_REPO}"
+            NPM_RESOLVE_REPO       = "${CFG.NPM_RESOLVE_REPO}"
+            FROGBOT_DOWNLOAD_URL   = "${CFG.FROGBOT_DOWNLOAD_URL}"
+            FROGBOT_MIN_SEVERITY   = "${CFG.FROGBOT_MIN_SEVERITY}"
+            FROGBOT_CMD_ON_MERGE   = "${CFG.FROGBOT_CMD_ON_MERGE}"
+            XRAY_WATCHES           = "${CFG.XRAY_WATCHES}"
+            JFROG_PROJECT          = "${CFG.JFROG_PROJECT}"
+            FROGBOT_DEPS_REPO      = "${CFG.FROGBOT_DEPS_REPO}"
+            // --- SonarQube Community Edition ---
+            SONAR_SERVER           = "${CFG.SONAR_SERVER}"
+            SONAR_SCANNER_TOOL     = "${CFG.SONAR_SCANNER_TOOL}"
+            SONAR_KEY_PER_FLOW     = "${CFG.SONAR_KEY_PER_FLOW}"
+            QUALITY_GATE_TIMEOUT   = "${CFG.QUALITY_GATE_TIMEOUT}"
+            // --- Plugins Maven ---
+            VERSIONS_PLUGIN        = "${CFG.VERSIONS_PLUGIN}"
+            HELP_PLUGIN            = "${CFG.HELP_PLUGIN}"
+            SONAR_MAVEN_PLUGIN     = "${CFG.SONAR_MAVEN_PLUGIN}"
+            // --- Mail ---
+            MAIL_FROM              = "${CFG.MAIL_FROM}"
+            MAIL_FALLBACK_TO       = "${CFG.MAIL_FALLBACK_TO}"
+            MAIL_CC                = "${CFG.MAIL_CC}"
+            // --- Dossiers de travail (dans le workspace) ---
+            REPORT_DIR             = "${CFG.REPORT_DIR}"
+            TMP_DIR                = "${CFG.TMP_DIR}"
+        }
+
+        stages {
+
+            stage('Prepare') {
+                steps {
                     script {
-                        gate('Build & Tests') {
-                            withArtifactory {
-                                if (ctx.type == 'maven') {
-                                    try {
-                                        runLogged('build', 'mvn clean verify')
-                                    } finally {
-                                        junit allowEmptyResults: true,
-                                              testResults: '**/target/surefire-reports/*.xml,**/target/failsafe-reports/*.xml'
+                        parseEvent()
+                        ctx.mode = resolveMode()
+                        if (!ctx.mode) {
+                            echo 'Événement non concerné par la CI/CD -> rien à faire.'
+                            currentBuild.result = 'NOT_BUILT'
+                            currentBuild.description = "Ignoré : ${ctx.projectPath ?: 'pas de payload'} ${ctx.source ?: ''} -> ${ctx.target ?: ''} (${ctx.action ?: '-'})"
+                        } else {
+                            currentBuild.displayName = "#${env.BUILD_NUMBER} ${ctx.projectName} !${ctx.mrIid} ${ctx.mode}"
+                        }
+                    }
+                }
+            }
+
+            stage('Checkout & Detect') {
+                when { expression { return ctx.mode != null } }
+                steps {
+                    script {
+                        checkoutSources()
+                        sh 'rm -rf "$REPORT_DIR" "$TMP_DIR" && mkdir -p "$REPORT_DIR" "$TMP_DIR"'
+
+                        ctx.type = fileExists('pom.xml') ? 'maven' : (fileExists('package.json') ? 'npm' : null)
+                        if (!ctx.type) {
+                            echo 'Ni pom.xml ni package.json -> rien à faire.'
+                            currentBuild.result = 'NOT_BUILT'
+                            currentBuild.description = "Ignoré : ${ctx.projectPath} n'est ni Maven ni npm"
+                            return
+                        }
+                        echo "Type de projet : ${ctx.type}"
+                        currentBuild.description = "${ctx.projectPath} | ${ctx.source} -> ${ctx.target} | ${ctx.mode} | ${ctx.type}"
+                        prepareToolConfig()
+
+                        // statut "running" : la MR reste bloquée pendant l'exécution
+                        ctx.statusSha = (ctx.mode == 'SNAPSHOT') ? ctx.buildSha : ctx.headSha
+                        setCommitStatus('running', "CI/CD ${ctx.mode} en cours")
+                        resolveCommitter()
+                    }
+                }
+            }
+
+            stage('Build & Tests') {
+                when { expression { return ctx.type != null } }
+                steps {
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script {
+                            gate('Build & Tests') {
+                                withArtifactory {
+                                    if (ctx.type == 'maven') {
+                                        try {
+                                            runLogged('build', 'mvn clean verify')
+                                        } finally {
+                                            junit allowEmptyResults: true,
+                                                  testResults: '**/target/surefire-reports/*.xml,**/target/failsafe-reports/*.xml'
+                                        }
+                                    } else {
+                                        runLogged('build', '''
+                                            if [ -f package-lock.json ]; then npm ci; else npm install; fi
+                                            npm run lint --if-present
+                                            npm run build --if-present
+                                            CI=true npm run test --if-present
+                                        ''')
                                     }
-                                } else {
-                                    runLogged('build', '''
-                                        if [ -f package-lock.json ]; then npm ci; else npm install; fi
-                                        npm run lint --if-present
-                                        npm run build --if-present
-                                        CI=true npm run test --if-present
-                                    ''')
                                 }
                             }
                         }
                     }
                 }
             }
-        }
 
-        stage('SonarQube') {
-            when { expression { return ctx.results['Build & Tests'] == 'OK' } }
-            steps {
-                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
-                    script {
-                        gate('SonarQube') { withArtifactory { sonarAnalysis() } }
+            stage('SonarQube') {
+                when { expression { return ctx.results['Build & Tests'] == 'OK' } }
+                steps {
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script {
+                            gate('SonarQube') { withArtifactory { sonarAnalysis() } }
+                        }
+                    }
+                }
+            }
+
+            stage('Xray (Frogbot)') {
+                when { expression { return ctx.results['Build & Tests'] == 'OK' } }
+                environment {
+                    JF_URL                         = "${env.JFROG_URL}"
+                    JF_ACCESS_TOKEN                = credentials("${CFG.JFROG_TOKEN_CRED}")
+                    JF_GIT_TOKEN                   = credentials("${CFG.GITLAB_API_CRED_ID}")
+                    JF_GIT_PROVIDER                = 'gitlab'
+                    JF_GIT_API_ENDPOINT            = "${env.GITLAB_URL}/api/v4"
+                    JF_FAIL                        = 'TRUE'
+                    JF_MIN_SEVERITY                = "${env.FROGBOT_MIN_SEVERITY}"
+                    JF_INCLUDE_ALL_VULNERABILITIES = 'FALSE'
+                }
+                steps {
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script {
+                            gate('Xray (Frogbot)') { withArtifactory { xrayScan() } }
+                        }
+                    }
+                }
+            }
+
+            stage('Livraison Artifactory') {
+                when {
+                    expression {
+                        return ctx.type != null && ctx.mode != 'VALIDATE' && ctx.failures.isEmpty() &&
+                               currentBuild.currentResult == 'SUCCESS' && !params.DRY_RUN
+                    }
+                }
+                steps {
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        script {
+                            gate('Livraison Artifactory') { withArtifactory { deliver() } }
+                        }
                     }
                 }
             }
         }
 
-        stage('Xray (Frogbot)') {
-            when { expression { return ctx.results['Build & Tests'] == 'OK' } }
-            environment {
-                JF_URL                         = "${env.JFROG_URL}"
-                JF_ACCESS_TOKEN                = credentials('jfrog-access-token')
-                JF_GIT_TOKEN                   = credentials('gitlab-api-token')
-                JF_GIT_PROVIDER                = 'gitlab'
-                JF_GIT_API_ENDPOINT            = "${env.GITLAB_URL}/api/v4"
-                JF_FAIL                        = 'TRUE'
-                JF_MIN_SEVERITY                = "${env.FROGBOT_MIN_SEVERITY}"
-                JF_INCLUDE_ALL_VULNERABILITIES = 'FALSE'
+        post {
+            always {
+                archiveArtifacts artifacts: '.ci/report/**', allowEmptyArchive: true
             }
-            steps {
-                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
-                    script {
-                        gate('Xray (Frogbot)') { withArtifactory { xrayScan() } }
+            success {
+                script {
+                    if (ctx.type) notifyResult('success')
+                }
+            }
+            failure {
+                script {
+                    if (ctx.mode) {
+                        if (ctx.failures.isEmpty()) {
+                            ctx.failures << [stage: 'Pipeline', cause: 'Erreur technique du pipeline, voir le log Jenkins.']
+                        }
+                        notifyResult('failed')
                     }
                 }
             }
-        }
-
-        stage('Livraison Artifactory') {
-            when {
-                expression {
-                    return ctx.type != null && ctx.mode != 'VALIDATE' && ctx.failures.isEmpty() &&
-                           currentBuild.currentResult == 'SUCCESS' && !params.DRY_RUN
+            aborted {
+                script {
+                    if (ctx.type) notifyResult('canceled')
                 }
             }
-            steps {
-                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
-                    script {
-                        gate('Livraison Artifactory') { withArtifactory { deliver() } }
-                    }
-                }
+            cleanup {
+                cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
             }
-        }
-    }
-
-    post {
-        always {
-            archiveArtifacts artifacts: '.ci/report/**', allowEmptyArchive: true
-        }
-        success {
-            script {
-                if (ctx.type) notifyResult('success')
-            }
-        }
-        failure {
-            script {
-                if (ctx.mode) {
-                    if (ctx.failures.isEmpty()) {
-                        ctx.failures << [stage: 'Pipeline', cause: 'Erreur technique du pipeline, voir le log Jenkins.']
-                    }
-                    notifyResult('failed')
-                }
-            }
-        }
-        aborted {
-            script {
-                if (ctx.type) notifyResult('canceled')
-            }
-        }
-        cleanup {
-            cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
         }
     }
 }
@@ -335,59 +354,13 @@ pipeline {
 // =====================================================================================
 //  ÉVÉNEMENT GITLAB
 // =====================================================================================
-// Source de l'événement : 1) payload du webhook (ou collé à la main)
-//                         2) sinon test manuel GITLAB_PROJECT + MR_IID -> événement reconstruit via l'API GitLab
-def loadEvent() {
+def parseEvent() {
     String payload = params.GL_PAYLOAD ?: env.GL_PAYLOAD
-    if (payload?.trim()) {
-        ctx.manual = false
-        return readJSON(text: payload, returnPojo: true)
+    if (!payload?.trim()) {
+        echo 'Aucun payload GitLab (lancement manuel sans payload).'
+        return
     }
-    if (params.GITLAB_PROJECT?.trim() && params.MR_IID?.trim()) {
-        ctx.manual = true
-        return eventFromApi(params.GITLAB_PROJECT.trim(), params.MR_IID.trim().replace('!', ''))
-    }
-    echo 'Aucun payload GitLab et pas de MR_IID : rien à exécuter.'
-    return null
-}
-
-// Reconstruit un payload "System Hook merge_request" à partir de l'API GitLab
-def eventFromApi(String projectPath, String mrIid) {
-    def proj = gitlabApi('GET', "projects/${projectPath.replace('/', '%2F')}")
-    if (!proj?.id) error("Projet GitLab introuvable ou inaccessible avec le token : ${projectPath}")
-
-    def mr = gitlabApi('GET', "projects/${proj.id}/merge_requests/${mrIid}")
-    if (!mr?.iid) error("Merge request !${mrIid} introuvable dans ${projectPath}")
-
-    String action = params.SIMULATE_EVENT
-    if (action == 'auto') action = (mr.state == 'merged') ? 'merge' : 'open'
-    if (action == 'merge' && mr.state != 'merged') {
-        error("La MR !${mrIid} est '${mr.state}' : impossible de simuler un merge (choisir 'open').")
-    }
-    if (action == 'open' && !(mr.state in ['opened', 'merged'])) {
-        error("La MR !${mrIid} est '${mr.state}' : seules les MR ouvertes ou fusionnées peuvent être testées.")
-    }
-    echo "TEST MANUEL : ${projectPath} !${mr.iid} (${mr.state}) ${mr.source_branch} -> ${mr.target_branch}, événement simulé '${action}'"
-
-    return [
-        object_kind      : 'merge_request',
-        project          : [id                 : proj.id,
-                            path_with_namespace: proj.path_with_namespace,
-                            git_http_url       : proj.http_url_to_repo,
-                            web_url            : proj.web_url],
-        object_attributes: [iid             : mr.iid,
-                            url             : mr.web_url,
-                            title           : mr.title,
-                            action          : action,
-                            source_branch   : mr.source_branch,
-                            target_branch   : mr.target_branch,
-                            oldrev          : null,
-                            last_commit     : [id: mr.sha, author: [email: null, name: mr.author?.name]],
-                            merge_commit_sha: (mr.merge_commit_sha ?: mr.squash_commit_sha)],
-    ]
-}
-
-def parseEvent(Map p) {
+    def p  = readJSON(text: payload, returnPojo: true)
     def oa = p.object_attributes ?: [:]
 
     ctx.objectKind  = p.object_kind

@@ -1,4 +1,3 @@
-#!/usr/bin/env groovy
 /*
  * =====================================================================================
  *  PIPELINE CI/CD (Continuous Delivery) : GitLab -> Jenkins -> SonarQube / Xray (Frogbot) -> Artifactory
@@ -144,108 +143,116 @@ import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
 // =====================================================================================
 //  TRIGGER : System Hook GitLab (Merge Request events) via Generic Webhook Trigger
 // =====================================================================================
-properties([
-    buildDiscarder(logRotator(numToKeepStr: '100', artifactNumToKeepStr: '20')),
-    pipelineTriggers([
-        GenericTrigger(
-            genericVariables: [
-                [key: 'GL_PAYLOAD',       value: '$'],
-                [key: 'GL_OBJECT_KIND',   value: '$.object_kind'],
-                [key: 'GL_ACTION',        value: '$.object_attributes.action'],
-                [key: 'GL_SOURCE_BRANCH', value: '$.object_attributes.source_branch'],
-                [key: 'GL_TARGET_BRANCH', value: '$.object_attributes.target_branch'],
-                [key: 'GL_PROJECT',       value: '$.project.path_with_namespace'],
-                [key: 'GL_MR_IID',        value: '$.object_attributes.iid'],
-            ],
-            tokenCredentialId        : CFG.WEBHOOK_TOKEN_CRED,   // envoyé par GitLab dans l'en-tête X-Gitlab-Token
-            causeString              : 'GitLab MR !$GL_MR_IID ($GL_ACTION) $GL_SOURCE_BRANCH -> $GL_TARGET_BRANCH [$GL_PROJECT]',
-            printContributedVariables: false,
-            printPostContent         : false,
-            silentResponse           : false,
-            regexpFilterText         : '$GL_OBJECT_KIND#$GL_ACTION',
-            regexpFilterExpression   : '^merge_request#(open|reopen|update|merge)$'
-        )
+// Point d'entrée de la shared library :
+//     @Library('new-generic-cicd') _
+//     genericCiCdSonarCommunity()                                   // configuration par défaut (CFG)
+//     genericCiCdSonarCommunity(GITLAB_URL: 'https://gitlab.acme.io', AGENT_LABEL: 'docker')   // surcharge de clés de CFG
+def call(Map config = [:]) {
+    CFG.putAll(config)
+
+    properties([
+        buildDiscarder(logRotator(numToKeepStr: '100', artifactNumToKeepStr: '20')),
+        pipelineTriggers([
+            GenericTrigger(
+                genericVariables: [
+                    [key: 'GL_PAYLOAD',       value: '$'],
+                    [key: 'GL_OBJECT_KIND',   value: '$.object_kind'],
+                    [key: 'GL_ACTION',        value: '$.object_attributes.action'],
+                    [key: 'GL_SOURCE_BRANCH', value: '$.object_attributes.source_branch'],
+                    [key: 'GL_TARGET_BRANCH', value: '$.object_attributes.target_branch'],
+                    [key: 'GL_PROJECT',       value: '$.project.path_with_namespace'],
+                    [key: 'GL_MR_IID',        value: '$.object_attributes.iid'],
+                ],
+                tokenCredentialId        : CFG.WEBHOOK_TOKEN_CRED,   // envoyé par GitLab dans l'en-tête X-Gitlab-Token
+                causeString              : 'GitLab MR !$GL_MR_IID ($GL_ACTION) $GL_SOURCE_BRANCH -> $GL_TARGET_BRANCH [$GL_PROJECT]',
+                printContributedVariables: false,
+                printPostContent         : false,
+                silentResponse           : false,
+                regexpFilterText         : '$GL_OBJECT_KIND#$GL_ACTION',
+                regexpFilterExpression   : '^merge_request#(open|reopen|update|merge)$'
+            )
+        ])
     ])
-])
 
-// =====================================================================================
-//  PIPELINE
-// =====================================================================================
-node(CFG.AGENT_LABEL) {
-    timestamps {
-        try {
-            stage('Analyse événement GitLab') {
-                parseEvent()
-                ctx.mode = resolveMode()
-            }
-            if (!ctx.mode) {
-                echo "Événement non concerné par la CI/CD -> rien à faire."
-                currentBuild.result = 'NOT_BUILT'
-                currentBuild.description = "Ignoré : ${ctx.projectPath ?: 'pas de payload'} ${ctx.source ?: ''} -> ${ctx.target ?: ''} (${ctx.action ?: '-'})"
-                return
-            }
-            currentBuild.displayName = "#${env.BUILD_NUMBER} ${ctx.projectName} !${ctx.mrIid} ${ctx.mode}"
+    // =====================================================================================
+    //  PIPELINE
+    // =====================================================================================
+    node(CFG.AGENT_LABEL) {
+        timestamps {
+            try {
+                stage('Analyse événement GitLab') {
+                    parseEvent()
+                    ctx.mode = resolveMode()
+                }
+                if (!ctx.mode) {
+                    echo "Événement non concerné par la CI/CD -> rien à faire."
+                    currentBuild.result = 'NOT_BUILT'
+                    currentBuild.description = "Ignoré : ${ctx.projectPath ?: 'pas de payload'} ${ctx.source ?: ''} -> ${ctx.target ?: ''} (${ctx.action ?: '-'})"
+                    return
+                }
+                currentBuild.displayName = "#${env.BUILD_NUMBER} ${ctx.projectName} !${ctx.mrIid} ${ctx.mode}"
 
-            stage('Checkout') {
-                checkoutSources()
-            }
-
-            stage('Détection type projet') {
-                ctx.type = detectProjectType()
-                echo "Type de projet détecté : ${ctx.type ?: 'aucun (ni pom.xml ni package.json)'}"
-            }
-            if (!ctx.type) {
-                currentBuild.result = 'NOT_BUILT'
-                currentBuild.description = "Ignoré : ${ctx.projectPath} n'est ni Maven ni npm"
-                return
-            }
-            currentBuild.description = "${ctx.projectPath} | ${ctx.source} -> ${ctx.target} | ${ctx.mode} | ${ctx.type}"
-
-            // Le statut "running" bloque la MR pendant l'exécution (avec "Pipelines must succeed")
-            ctx.statusSha = (ctx.mode == 'SNAPSHOT') ? ctx.buildSha : ctx.headSha
-            setCommitStatus('running', "CI/CD ${ctx.mode} en cours")
-            resolveCommitter()
-
-            withCiEnv {
-                runStep('Build & Tests') { buildAndTest() }
-
-                if (ctx.results['Build & Tests'] == 'OK') {
-                    runStep('SonarQube') { sonarAnalysis() }
-                    runStep('Xray (Frogbot)') { xrayScan() }
-                } else {
-                    skipStep('SonarQube', 'build en échec')
-                    skipStep('Xray (Frogbot)', 'build en échec')
+                stage('Checkout') {
+                    checkoutSources()
                 }
 
-                if (ctx.mode == 'VALIDATE') {
-                    skipStep('Livraison Artifactory', 'validation de MR uniquement (livraison au merge)')
-                } else if (!ctx.failures.isEmpty()) {
-                    skipStep('Livraison Artifactory', 'contrôles qualité/sécurité en échec')
-                } else {
-                    runStep('Livraison Artifactory') { deliver() }
+                stage('Détection type projet') {
+                    ctx.type = detectProjectType()
+                    echo "Type de projet détecté : ${ctx.type ?: 'aucun (ni pom.xml ni package.json)'}"
                 }
-            }
-        } catch (FlowInterruptedException fie) {
-            ctx.aborted = true
-            throw fie
-        } catch (Exception e) {
-            ctx.failures << [stage: 'Pipeline', cause: (e.message ?: e.toString())]
-            currentBuild.result = 'FAILURE'
-        } finally {
-            if (ctx.mode && (ctx.type || !ctx.failures.isEmpty())) {
-                stage('Notification') {
-                    try {
-                        notifyResult()
-                    } catch (Exception ne) {
-                        echo "Notification impossible : ${ne.message}"
+                if (!ctx.type) {
+                    currentBuild.result = 'NOT_BUILT'
+                    currentBuild.description = "Ignoré : ${ctx.projectPath} n'est ni Maven ni npm"
+                    return
+                }
+                currentBuild.description = "${ctx.projectPath} | ${ctx.source} -> ${ctx.target} | ${ctx.mode} | ${ctx.type}"
+
+                // Le statut "running" bloque la MR pendant l'exécution (avec "Pipelines must succeed")
+                ctx.statusSha = (ctx.mode == 'SNAPSHOT') ? ctx.buildSha : ctx.headSha
+                setCommitStatus('running', "CI/CD ${ctx.mode} en cours")
+                resolveCommitter()
+
+                withCiEnv {
+                    runStep('Build & Tests') { buildAndTest() }
+
+                    if (ctx.results['Build & Tests'] == 'OK') {
+                        runStep('SonarQube') { sonarAnalysis() }
+                        runStep('Xray (Frogbot)') { xrayScan() }
+                    } else {
+                        skipStep('SonarQube', 'build en échec')
+                        skipStep('Xray (Frogbot)', 'build en échec')
+                    }
+
+                    if (ctx.mode == 'VALIDATE') {
+                        skipStep('Livraison Artifactory', 'validation de MR uniquement (livraison au merge)')
+                    } else if (!ctx.failures.isEmpty()) {
+                        skipStep('Livraison Artifactory', 'contrôles qualité/sécurité en échec')
+                    } else {
+                        runStep('Livraison Artifactory') { deliver() }
                     }
                 }
-            }
-            if (!ctx.failures.isEmpty() && !ctx.aborted) {
+            } catch (FlowInterruptedException fie) {
+                ctx.aborted = true
+                throw fie
+            } catch (Exception e) {
+                ctx.failures << [stage: 'Pipeline', cause: (e.message ?: e.toString())]
                 currentBuild.result = 'FAILURE'
+            } finally {
+                if (ctx.mode && (ctx.type || !ctx.failures.isEmpty())) {
+                    stage('Notification') {
+                        try {
+                            notifyResult()
+                        } catch (Exception ne) {
+                            echo "Notification impossible : ${ne.message}"
+                        }
+                    }
+                }
+                if (!ctx.failures.isEmpty() && !ctx.aborted) {
+                    currentBuild.result = 'FAILURE'
+                }
+                cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
+                dir("${env.WORKSPACE}@tmp") { deleteDir() }
             }
-            cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
-            dir("${env.WORKSPACE}@tmp") { deleteDir() }
         }
     }
 }
