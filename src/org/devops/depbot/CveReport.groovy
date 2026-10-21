@@ -29,7 +29,7 @@ class CveReport implements Serializable {
      * maxDeps = 0 renders every dependency (archived report), > 0 truncates (mail).
      */
     @NonCPS
-    static String toHtml(List findings, String bootstrap, String buildUrl, int managedCount, boolean catalogOk, String minSeverity, int maxDeps = 0) {
+    static String toHtml(List findings, String bootstrap, String buildUrl, int managedCount, boolean catalogOk, String minSeverity, int maxDeps = 0, boolean catalogSkipped = false) {
         final int MAX_CVES_PER_DEP = 5
         String font = "-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif"
         String mono = "ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace"
@@ -70,8 +70,9 @@ class CveReport implements Serializable {
 
         // ── warning when Catalog failed ────────────────────────────────────────────
         if (!catalogOk) {
+            String why = catalogSkipped ? 'JFrog Catalog was skipped (SKIP_CATALOG)' : 'JFrog Catalog was unavailable'
             h << '<tr><td style="padding:0 0 16px"><div style="padding:12px 16px;background:#fff8c5;border:1px solid #d4a72c;border-radius:6px;font-size:13px">' +
-                 '&#9888;&nbsp; JFrog Catalog was unavailable: results are based on JFrog Xray only.</div></td></tr>'
+                 "&#9888;&nbsp; ${why}: results are based on JFrog Xray only.</div></td></tr>"
         }
 
         // ── repository-like card ───────────────────────────────────────────────────

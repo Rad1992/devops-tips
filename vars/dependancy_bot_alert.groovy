@@ -24,7 +24,8 @@ import org.devops.depbot.CveReport
  *     dependancy_bot_alert(
  *         bootstrapRepo: 'git@gitlab.mycompany.com:platform/company-bootstrap.git',
  *         mailTo       : 'architects@mycompany.com',
- *         minSeverity  : 'High'
+ *         minSeverity  : 'High',
+ *         skipCatalog  : true          // Xray only
  *     )
  *
  * Plugins: Pipeline, Git, Pipeline Utility Steps, Email Extension, Config File Provider,
@@ -50,6 +51,7 @@ import org.devops.depbot.CveReport
     mailTo                 : 'architects@mycompany.com',
     minSeverity            : 'Low',                        // Low | Medium | High | Critical
     mailWhenClean          : true,
+    skipCatalog            : false,                        // true = Xray only (no JFrog Catalog enrichment)
     mailMaxDependencies    : 20,                           // dependencies shown in the mail body (full list in the archived report)
 
     // JFrog
@@ -73,6 +75,7 @@ def call(Map config = [:]) {
     String buildsToKeep  = cfg.buildsToKeep.toString()
     int timeoutMinutes   = cfg.timeoutMinutes as int
     boolean mailWhenClean = cfg.mailWhenClean as boolean
+    boolean skipCatalog   = cfg.skipCatalog as boolean
 
     pipeline {
         agent { label "${cfg.agentLabel}" }
@@ -94,6 +97,7 @@ def call(Map config = [:]) {
             string(name: 'MAIL_TO',          defaultValue: cfg.mailTo, description: 'Comma-separated recipients')
             choice(name: 'MIN_SEVERITY',     choices: severityChoices, description: 'Ignore CVEs below this severity')
             booleanParam(name: 'MAIL_WHEN_CLEAN', defaultValue: mailWhenClean, description: 'Send the mail even when no CVE is found')
+            booleanParam(name: 'SKIP_CATALOG',    defaultValue: skipCatalog, description: 'Skip the JFrog Catalog stage (report based on Xray only)')
         }
 
         environment {
@@ -169,6 +173,7 @@ def call(Map config = [:]) {
             }
 
             stage('Catalog: CVE details') {
+                when { expression { !params.SKIP_CATALOG } }
                 steps {
                     // Catalog is an enrichment: if it fails the report is still sent with Xray data only
                     catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
@@ -212,6 +217,7 @@ def call(Map config = [:]) {
                         def managed   = readJSON file: 'report/managed-dependencies.json', returnPojo: true
                         def xray      = readJSON file: 'report/xray.json', returnPojo: true
                         def catalogOk = fileExists('report/catalog.json')
+                        boolean catalogSkipped = params.SKIP_CATALOG as boolean
                         def catalog   = catalogOk ? readJSON(file: 'report/catalog.json', returnPojo: true) : [:]
 
                         def findings = CveAudit.buildFindings(managed, xray, catalog, params.MIN_SEVERITY)
@@ -219,9 +225,9 @@ def call(Map config = [:]) {
                         writeFile file: 'report/cve-report.csv',  text: CveReport.toCsv(findings)
                         // full report (archived, linked from the mail button) + truncated digest for the mail body
                         writeFile file: 'report/cve-report.html',
-                                  text: CveReport.toHtml(findings, env.BOOTSTRAP_GAV, env.BUILD_URL, managed.size(), catalogOk, params.MIN_SEVERITY, 0)
+                                  text: CveReport.toHtml(findings, env.BOOTSTRAP_GAV, env.BUILD_URL, managed.size(), catalogOk, params.MIN_SEVERITY, 0, catalogSkipped)
                         writeFile file: 'report/mail.html',
-                                  text: CveReport.toHtml(findings, env.BOOTSTRAP_GAV, env.BUILD_URL, managed.size(), catalogOk, params.MIN_SEVERITY, cfg.mailMaxDependencies as int)
+                                  text: CveReport.toHtml(findings, env.BOOTSTRAP_GAV, env.BUILD_URL, managed.size(), catalogOk, params.MIN_SEVERITY, cfg.mailMaxDependencies as int, catalogSkipped)
 
                         env.VULN_DEPS = "${findings.size()}"
                         env.CVE_COUNT = "${CveAudit.cveCount(findings)}"
