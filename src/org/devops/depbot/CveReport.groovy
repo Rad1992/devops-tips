@@ -12,10 +12,10 @@ class CveReport implements Serializable {
     @NonCPS
     static String toCsv(List findings) {
         def q = { v -> '"' + (v == null ? '' : v.toString().replace('"', '""')) + '"' }
-        def lines = ['groupId;artifactId;currentVersion;cve;severity;cvss;knownExploit;fixedIn;recommendedVersion;source']
+        def lines = ['groupId;artifactId;currentVersion;cve;severity;cvss;xrayCvssV3;xrayCvssV3Vector;knownExploit;fixedIn;recommendedVersion;source']
         findings.each { f ->
             f.cves.each { c ->
-                lines << [f.group, f.artifact, f.version, c.id, c.severity, c.cvss, c.exploit,
+                lines << [f.group, f.artifact, f.version, c.id, c.severity, c.cvss, c.cvssV3, c.cvssV3Vector, c.exploit,
                           c.fixedIn, f.recommended, c.source].collect(q).join(';')
             }
         }
@@ -119,7 +119,12 @@ class CveReport implements Serializable {
                 String link = id.startsWith('CVE-') ?
                         "<a href=\"https://nvd.nist.gov/vuln/detail/${esc(id)}\" style=\"color:#0969da;text-decoration:none\">${esc(id)}</a>" : esc(id)
                 def extras = []
-                if (c.cvss != null) extras << "CVSS ${c.cvss}"
+                if (c.cvssV3 != null) {
+                    String vector = c.cvssV3Vector ? " title=\"${esc(c.cvssV3Vector)}\"" : ''
+                    extras << "<span${vector}>CVSS v3 ${c.cvssV3}</span>"
+                } else if (c.cvss != null) {
+                    extras << "CVSS ${c.cvss}"
+                }
                 if (c.fixedIn)      extras << "fixed in ${esc(c.fixedIn)}"
                 String line = "${label(c.severity)}&nbsp; ${link}" +
                               (extras ? " <span style=\"font-size:12px;color:#57606a\">&middot; ${extras.join(' &middot; ')}</span>" : '') +

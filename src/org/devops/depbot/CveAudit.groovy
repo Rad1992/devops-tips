@@ -53,8 +53,13 @@ class CveAudit implements Serializable {
                     e.severity = issue.severity
                     e.summary  = issue.summary
                     def raw = (issue.cves ?: []).find { it.cve == cve }?.cvss_v3      // e.g. "9.8/CVSS:3.1/AV:N/..."
-                    def score = raw ? raw.toString().tokenize('/')[0] : null
-                    if (score && score.isNumber()) e.cvss = score.toDouble()
+                    if (raw) {
+                        String rawStr = raw.toString()
+                        String score  = rawStr.tokenize('/')[0]
+                        if (score && score.isNumber()) e.cvss = score.toDouble()
+                        int slash = rawStr.indexOf('/')
+                        if (slash > 0) e.cvssVector = rawStr.substring(slash + 1)        // "CVSS:3.1/AV:N/AC:L/..."
+                    }
                     e.fixed = (e.fixed + fixed).unique()
                 }
             }
@@ -147,6 +152,8 @@ class CveAudit implements Serializable {
                     id      : id,
                     severity: sev,
                     cvss    : scores ? scores.max() : null,
+                    cvssV3  : xi.cvss,                                // CVSS v3 base score reported by Xray
+                    cvssV3Vector: xi.cvssVector ?: '',
                     exploit : ci.exploit ?: false,
                     fixedIn : fixed.join(', '),
                     bestFix : pickFix(d.v, fixed),
