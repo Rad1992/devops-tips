@@ -68,18 +68,26 @@ class CveAudit implements Serializable {
         return raw.replaceAll(/[\[\]\(\)\s]/, '').tokenize(',').find { it }
     }
 
+    /**
+     * JFrog OneModel GraphQL (POST /onemodel/api/v1/graphql), public catalog namespace.
+     * One aliased getPackage per dependency, narrowed to the audited version.
+     */
     @NonCPS
     static String catalogQuery(List chunk) {
         def parts = []
         for (int i = 0; i < chunk.size(); i++) {
             def d = chunk[i]
-            parts << """p${i}: packageVersion(type: "maven", name: "${d.g}:${d.a}", version: "${d.v}") {
-      vulnerabilities(first: 100, orderBy: {field: SEVERITY, direction: DESC}) {
-        edges { node { name severity cvss { preferredBaseScore } knownExploit { dateAdded } } }
+            parts << """    p${i}: getPackage(type: "maven", name: "${d.g}:${d.a}") {
+      versionsConnection(first: 1, where: {version: "${d.v}"}) {
+        edges { node { version securityInfo {
+          vulnerabilitiesConnection(first: 100) {
+            edges { node { name severity cvss { preferredBaseScore } knownExploit { addedAt } } }
+          }
+        } } }
       }
     }"""
         }
-        return 'query {\n' + parts.join('\n') + '\n}'
+        return 'query {\n  publicPackages {\n' + parts.join('\n') + '\n  }\n}'
     }
 
     @NonCPS
@@ -89,13 +97,16 @@ class CveAudit implements Serializable {
 
     @NonCPS
     static void mergeCatalog(Map acc, List chunk, Map resp) {
-        def data = resp?.data ?: [:]
+        def data = resp?.data?.publicPackages ?: [:]
         for (int i = 0; i < chunk.size(); i++) {
-            def d  = chunk[i]
-            def pv = data["p${i}".toString()]
+            def d   = chunk[i]
+            def pkg = data["p${i}".toString()]
+            if (!pkg) continue
+            // keep only the audited version, in case the server ignores the version filter
+            def pv = (pkg.versionsConnection?.edges ?: []).collect { it.node }.find { it?.version == d.v }
             if (!pv) continue
             String gav = "${d.g}:${d.a}:${d.v}"
-            (pv.vulnerabilities?.edges ?: []).each { edge ->
+            (pv.securityInfo?.vulnerabilitiesConnection?.edges ?: []).each { edge ->
                 def n = edge.node
                 if (!n?.name) return
                 if (!acc.containsKey(gav)) acc[gav] = [:]

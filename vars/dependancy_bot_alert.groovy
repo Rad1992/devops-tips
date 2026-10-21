@@ -9,7 +9,8 @@ import org.devops.depbot.CveReport
  *     -> every dependency it manages: its own <dependencyManagement> + everything
  *        inherited from spring-boot-dependencies (imported BOMs are inlined).
  *  2. JFrog Xray  (POST /xray/api/v1/summary/component) -> security issues + fixed versions per GAV.
- *  3. JFrog Catalog (GraphQL)                            -> CVEs, severity, CVSS, known exploit per GAV.
+ *  3. JFrog Catalog (OneModel GraphQL, POST /onemodel/api/v1/graphql)
+ *                                                       -> CVEs, severity, CVSS, known exploit per GAV.
  *  4. Merges both, computes a recommended patched version per dependency,
  *     mails an HTML report (+ CSV attachment) and archives everything.
  *
@@ -28,7 +29,9 @@ import org.devops.depbot.CveReport
  *
  * Plugins: Pipeline, Git, Pipeline Utility Steps, Email Extension, Config File Provider,
  *          Credentials Binding, Timestamper.
- * Credentials: 'gitlab-ssh-key' (SSH key), 'jfrog-access-token' (secret text, Xray read).
+ * Credentials: 'gitlab-ssh-key' (SSH key), 'jfrog-access-token' (secret text, Xray read;
+ *              OneModel needs a token with the wildcard audience '*@*').
+ * Requires Artifactory 7.104.1+ (OneModel GraphQL).
  * Managed file: 'maven-settings-artifactory' (settings.xml pointing to Artifactory).
  */
 
@@ -51,7 +54,7 @@ import org.devops.depbot.CveReport
 
     // JFrog
     jfrogUrl               : 'https://mycompany.jfrog.io', // platform URL, no trailing slash
-    catalogPath            : '/catalog/api/v1/custom/graphql',
+    catalogPath            : '/onemodel/api/v1/graphql',   // OneModel (replaces /catalog/api/v1/custom/graphql)
     xrayChunk              : 100,
     catalogChunk           : 25,
 
@@ -97,7 +100,7 @@ def call(Map config = [:]) {
             JFROG_URL     = "${cfg.jfrogUrl}"                       // platform URL, no trailing slash
             CATALOG_PATH  = "${cfg.catalogPath}"
             XRAY_CHUNK    = "${cfg.xrayChunk}"                      // components per Xray call
-            CATALOG_CHUNK = "${cfg.catalogChunk}"                   // packageVersion aliases per GraphQL call
+            CATALOG_CHUNK = "${cfg.catalogChunk}"                   // getPackage aliases per GraphQL call
         }
 
         stages {

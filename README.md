@@ -5,7 +5,7 @@ packaged as a [Jenkins Shared Library](https://www.jenkins.io/doc/book/pipeline/
 
 ```
 vars/                                  # global steps, callable from any Jenkinsfile / Pipeline script
-├── dependancy_bot_alert.groovy        # daily CVE audit of the bootstrap parent (Xray + Catalog) -> HTML mail
+├── dependancy_bot_alert.groovy        # daily CVE audit of the bootstrap parent (Xray + Catalog OneModel) -> HTML mail
 ├── genericCiCd.groovy                 # CI/CD on GitLab MR events (scripted, SonarQube Developer Edition+)
 ├── genericCiCdSonarCommunity.groovy   # same, SonarQube Community Edition (one Sonar key per flow)
 ├── genericCiCdWithFilters.groovy      # declarative variant, branch filtering done in the webhook trigger
