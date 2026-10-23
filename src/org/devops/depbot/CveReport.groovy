@@ -12,10 +12,10 @@ class CveReport implements Serializable {
     @NonCPS
     static String toCsv(List findings) {
         def q = { v -> '"' + (v == null ? '' : v.toString().replace('"', '""')) + '"' }
-        def lines = ['groupId;artifactId;currentVersion;cve;severity;cvss;knownExploit;fixedIn;recommendedVersion;source']
+        def lines = ['groupId;artifactId;currentVersion;cve;severity;cvss;xrayCvssV3;xrayCvssV3Vector;knownExploit;fixedIn;recommendedVersion;source']
         findings.each { f ->
             f.cves.each { c ->
-                lines << [f.group, f.artifact, f.version, c.id, c.severity, c.cvss, c.exploit,
+                lines << [f.group, f.artifact, f.version, c.id, c.severity, c.cvss, c.cvssV3, c.cvssV3Vector, c.exploit,
                           c.fixedIn, f.recommended, c.source].collect(q).join(';')
             }
         }
@@ -29,7 +29,7 @@ class CveReport implements Serializable {
      * maxDeps = 0 renders every dependency (archived report), > 0 truncates (mail).
      */
     @NonCPS
-    static String toHtml(List findings, String bootstrap, String buildUrl, int managedCount, boolean catalogOk, String minSeverity, int maxDeps = 0) {
+    static String toHtml(List findings, String bootstrap, String buildUrl, int managedCount, boolean catalogOk, String minSeverity, int maxDeps = 0, boolean catalogSkipped = false) {
         final int MAX_CVES_PER_DEP = 5
         String font = "-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif"
         String mono = "ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace"
@@ -70,8 +70,9 @@ class CveReport implements Serializable {
 
         // ── warning when Catalog failed ────────────────────────────────────────────
         if (!catalogOk) {
+            String why = catalogSkipped ? 'JFrog Catalog was skipped (SKIP_CATALOG)' : 'JFrog Catalog was unavailable'
             h << '<tr><td style="padding:0 0 16px"><div style="padding:12px 16px;background:#fff8c5;border:1px solid #d4a72c;border-radius:6px;font-size:13px">' +
-                 '&#9888;&nbsp; JFrog Catalog was unavailable: results are based on JFrog Xray only.</div></td></tr>'
+                 "&#9888;&nbsp; ${why}: results are based on JFrog Xray only.</div></td></tr>"
         }
 
         // ── repository-like card ───────────────────────────────────────────────────
@@ -119,7 +120,12 @@ class CveReport implements Serializable {
                 String link = id.startsWith('CVE-') ?
                         "<a href=\"https://nvd.nist.gov/vuln/detail/${esc(id)}\" style=\"color:#0969da;text-decoration:none\">${esc(id)}</a>" : esc(id)
                 def extras = []
-                if (c.cvss != null) extras << "CVSS ${c.cvss}"
+                if (c.cvssV3 != null) {
+                    String vector = c.cvssV3Vector ? " title=\"${esc(c.cvssV3Vector)}\"" : ''
+                    extras << "<span${vector}>CVSS v3 ${c.cvssV3}</span>"
+                } else if (c.cvss != null) {
+                    extras << "CVSS ${c.cvss}"
+                }
                 if (c.fixedIn)      extras << "fixed in ${esc(c.fixedIn)}"
                 String line = "${label(c.severity)}&nbsp; ${link}" +
                               (extras ? " <span style=\"font-size:12px;color:#57606a\">&middot; ${extras.join(' &middot; ')}</span>" : '') +

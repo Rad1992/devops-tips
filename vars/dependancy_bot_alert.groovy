@@ -24,7 +24,8 @@ import org.devops.depbot.CveReport
  *     dependancy_bot_alert(
  *         bootstrapRepo: 'git@gitlab.mycompany.com:platform/company-bootstrap.git',
  *         mailTo       : 'architects@mycompany.com',
- *         minSeverity  : 'High'
+ *         minSeverity  : 'High',
+ *         skipCatalog  : true          // Xray only
  *     )
  *
  * Plugins: Pipeline, Git, Pipeline Utility Steps, Email Extension, Config File Provider,
@@ -50,6 +51,7 @@ import org.devops.depbot.CveReport
     mailTo                 : 'architects@mycompany.com',
     minSeverity            : 'Low',                        // Low | Medium | High | Critical
     mailWhenClean          : true,
+    skipCatalog            : false,                        // true = Xray only (no JFrog Catalog enrichment)
     mailMaxDependencies    : 20,                           // dependencies shown in the mail body (full list in the archived report)
 
     // JFrog
@@ -73,6 +75,7 @@ def call(Map config = [:]) {
     String buildsToKeep  = cfg.buildsToKeep.toString()
     int timeoutMinutes   = cfg.timeoutMinutes as int
     boolean mailWhenClean = cfg.mailWhenClean as boolean
+    boolean skipCatalog   = cfg.skipCatalog as boolean
 
     pipeline {
         agent { label "${cfg.agentLabel}" }
@@ -94,6 +97,7 @@ def call(Map config = [:]) {
             string(name: 'MAIL_TO',          defaultValue: cfg.mailTo, description: 'Comma-separated recipients')
             choice(name: 'MIN_SEVERITY',     choices: severityChoices, description: 'Ignore CVEs below this severity')
             booleanParam(name: 'MAIL_WHEN_CLEAN', defaultValue: mailWhenClean, description: 'Send the mail even when no CVE is found')
+            booleanParam(name: 'SKIP_CATALOG',    defaultValue: skipCatalog, description: 'Skip the JFrog Catalog stage (report based on Xray only)')
         }
 
         environment {
@@ -107,7 +111,7 @@ def call(Map config = [:]) {
 
             stage('Prepare') {
                 steps {
-                    sh 'rm -rf report tmp && mkdir -p report tmp'
+                    sh 'rm -rf report tmp && mkdir -p report/catalog tmp'
                 }
             }
 
@@ -169,6 +173,7 @@ def call(Map config = [:]) {
             }
 
             stage('Catalog: CVE details') {
+                when { expression { !params.SKIP_CATALOG } }
                 steps {
                     // Catalog is an enrichment: if it fails the report is still sent with Xray data only
                     catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
@@ -176,23 +181,29 @@ def call(Map config = [:]) {
                             def managed = readJSON file: 'report/managed-dependencies.json', returnPojo: true
                             def chunks  = CveAudit.chunk(managed, env.CATALOG_CHUNK as int)
                             def catalog = [:]
+                            int ok = 0, rejected = 0
                             withCredentials([string(credentialsId: cfg.jfrogTokenCredentialsId, variable: 'JF_TOKEN')]) {
                                 for (int i = 0; i < chunks.size(); i++) {
-                                    writeJSON file: "tmp/catalog-req-${i}.json", json: [query: CveAudit.catalogQuery(chunks[i])]
-                                    sh """
-                                        curl -sS --fail-with-body -X POST \\
-                                          -H "Authorization: Bearer \$JF_TOKEN" \\
-                                          -H 'Content-Type: application/json' \\
-                                          --data @tmp/catalog-req-${i}.json \\
-                                          -o tmp/catalog-resp-${i}.json \\
-                                          "\$JFROG_URL\$CATALOG_PATH"
-                                    """
-                                    def resp = readJSON file: "tmp/catalog-resp-${i}.json", returnPojo: true
-                                    def warn = CveAudit.graphqlErrors(resp)
-                                    if (warn) echo "Catalog warnings (chunk ${i}): ${warn}"
-                                    CveAudit.mergeCatalog(catalog, chunks[i], resp)
+                                    def resp = catalogRequest("${i}", chunks[i])
+                                    if (resp != null) {
+                                        ok++
+                                        CveAudit.mergeCatalog(catalog, chunks[i], resp)
+                                        continue
+                                    }
+                                    if (chunks[i].size() == 1) { rejected++; continue }
+                                    // chunk rejected: retry one dependency at a time to isolate the offending one(s)
+                                    echo "Catalog: chunk ${i} rejected, retrying its ${chunks[i].size()} dependencies one by one"
+                                    for (int j = 0; j < chunks[i].size(); j++) {
+                                        def single = [chunks[i][j]]
+                                        def r = catalogRequest("${i}-${j}", single)
+                                        if (r == null) { rejected++; continue }
+                                        ok++
+                                        CveAudit.mergeCatalog(catalog, single, r)
+                                    }
                                 }
                             }
+                            if (ok == 0) error "Catalog: every request was rejected (see report/catalog/ for the request and response bodies)"
+                            if (rejected) echo "Catalog: ${rejected} request(s) rejected, their dependencies are reported with Xray data only"
                             writeJSON file: 'report/catalog.json', json: catalog, pretty: 2
                             echo "Catalog: ${catalog.size()} vulnerable components"
                         }
@@ -206,6 +217,7 @@ def call(Map config = [:]) {
                         def managed   = readJSON file: 'report/managed-dependencies.json', returnPojo: true
                         def xray      = readJSON file: 'report/xray.json', returnPojo: true
                         def catalogOk = fileExists('report/catalog.json')
+                        boolean catalogSkipped = params.SKIP_CATALOG as boolean
                         def catalog   = catalogOk ? readJSON(file: 'report/catalog.json', returnPojo: true) : [:]
 
                         def findings = CveAudit.buildFindings(managed, xray, catalog, params.MIN_SEVERITY)
@@ -213,9 +225,9 @@ def call(Map config = [:]) {
                         writeFile file: 'report/cve-report.csv',  text: CveReport.toCsv(findings)
                         // full report (archived, linked from the mail button) + truncated digest for the mail body
                         writeFile file: 'report/cve-report.html',
-                                  text: CveReport.toHtml(findings, env.BOOTSTRAP_GAV, env.BUILD_URL, managed.size(), catalogOk, params.MIN_SEVERITY, 0)
+                                  text: CveReport.toHtml(findings, env.BOOTSTRAP_GAV, env.BUILD_URL, managed.size(), catalogOk, params.MIN_SEVERITY, 0, catalogSkipped)
                         writeFile file: 'report/mail.html',
-                                  text: CveReport.toHtml(findings, env.BOOTSTRAP_GAV, env.BUILD_URL, managed.size(), catalogOk, params.MIN_SEVERITY, cfg.mailMaxDependencies as int)
+                                  text: CveReport.toHtml(findings, env.BOOTSTRAP_GAV, env.BUILD_URL, managed.size(), catalogOk, params.MIN_SEVERITY, cfg.mailMaxDependencies as int, catalogSkipped)
 
                         env.VULN_DEPS = "${findings.size()}"
                         env.CVE_COUNT = "${CveAudit.cveCount(findings)}"
@@ -252,4 +264,36 @@ def call(Map config = [:]) {
             }
         }
     }
+}
+
+/*
+ * POSTs one Catalog (OneModel GraphQL) query for the given dependencies.
+ * Request and response are kept under report/catalog/ (archived) for troubleshooting.
+ * Returns the parsed response, or null when the server rejected the request (HTTP status != 200).
+ * Must be called inside withCredentials (JF_TOKEN).
+ */
+def catalogRequest(String tag, List deps) {
+    String req  = "report/catalog/req-${tag}.json"
+    String resp = "report/catalog/resp-${tag}.json"
+    writeJSON file: req, json: [query: CveAudit.catalogQuery(deps)]
+    // no --fail-with-body: on a 4xx we still want to read the GraphQL error message
+    String status = sh(returnStdout: true, script: """
+        curl -sS -X POST \\
+          -H "Authorization: Bearer \$JF_TOKEN" \\
+          -H 'Content-Type: application/json' \\
+          --data @${req} \\
+          -o ${resp} -w '%{http_code}' \\
+          "\$JFROG_URL\$CATALOG_PATH"
+    """).trim()
+    String body = fileExists(resp) ? readFile(resp) : ''
+    def json = null
+    try { json = readJSON(text: body ?: '{}', returnPojo: true) } catch (ignored) { }
+    String errors = (json instanceof Map) ? CveAudit.graphqlErrors(json) : ''
+    if (status != '200') {
+        String sample = deps.collect { "${it.g}:${it.a}:${it.v}" }.take(3).join(', ') + (deps.size() > 3 ? ', ...' : '')
+        echo "Catalog HTTP ${status} for [${sample}]: ${errors ?: body.take(1000)}"
+        return null
+    }
+    if (errors) echo "Catalog warnings (${tag}): ${errors}"
+    return json
 }
