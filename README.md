@@ -9,11 +9,14 @@ vars/                                  # global steps, callable from any Jenkins
 ├── genericCiCd.groovy                 # CI/CD on GitLab MR events (scripted, SonarQube Developer Edition+)
 ├── genericCiCdSonarCommunity.groovy   # same, SonarQube Community Edition (one Sonar key per flow)
 ├── genericCiCdWithFilters.groovy      # declarative variant, branch filtering done in the webhook trigger
-└── genericCiCdTest.groovy             # declarative variant + manual test on a single project / MR (DRY_RUN)
+├── genericCiCdTest.groovy             # declarative variant + manual test on a single project / MR (DRY_RUN)
+└── genericCiCdSimple.groovy           # SIMPLIFIED CI/CD, each feature can be enabled step by step
 src/org/devops/depbot/
 ├── CveAudit.groovy                    # Xray / Catalog parsing, version comparison, findings
 └── CveReport.groovy                   # CSV + "Security alert digest" HTML rendering
 ```
+
+> **Mise en place pas à pas du pipeline CI/CD générique (FR)** : [docs/GUIDE-CICD-SIMPLE.md](docs/GUIDE-CICD-SIMPLE.md)
 
 ## 1. Register the library in Jenkins
 
